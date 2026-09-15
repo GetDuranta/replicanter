@@ -28,6 +28,8 @@ func TestWalkMetadata(t *testing.T) {
 		{testGraphRoot + "/overlay-images/" + layerID, true, "an image's big-data"},
 		{testGraphRoot + "/overlay-layers", true, "layer metadata"},
 		{testGraphRoot + "/overlay-layers/" + layerID, true, "a layer's big-data"},
+		{testGraphRoot + "/overlay-containers", true, "the library creates its lock file when initializing a store"},
+		{testGraphRoot + "/overlay-containers/" + layerID, true, "a container's big-data"},
 
 		{testGraphRoot + "/overlay/" + layerID + "/diff", false, "layer content: in-layer ids, not ours"},
 		{testGraphRoot + "/overlay/" + layerID + "/merged", false, "a live overlay mount point"},
@@ -35,7 +37,6 @@ func TestWalkMetadata(t *testing.T) {
 		{testGraphRoot + "/overlay/staging", false, "layer content in flight"},
 		{testGraphRoot + "/overlay/tempdirs", false, "layer content pending deletion"},
 		{testGraphRoot + "/volumes", false, "libpod's own state, never written by us"},
-		{testGraphRoot + "/overlay-containers", false, "libpod's own state"},
 		{testGraphRoot + "/networks", false, "libpod's own state"},
 		{"/somewhere/else", false, "outside the graphroot entirely"},
 	}
@@ -63,6 +64,15 @@ func TestStoreMetadataPaths(t *testing.T) {
 		testGraphRoot + "/overlay-layers/volatile-layers.json",
 		testGraphRoot + "/overlay/l",
 		testGraphRoot + "/overlay/staging",
+		// Created once, by whoever first opens the store. In an empty graphroot
+		// that is us, as root.
+		testGraphRoot + "/storage.lock",
+		testGraphRoot + "/userns.lock",
+		testGraphRoot + "/overlay-layers/layers.lock",
+		testGraphRoot + "/overlay-images/images.lock",
+		testGraphRoot + "/overlay-containers",
+		testGraphRoot + "/overlay-containers/containers.lock",
+		testGraphRoot + "/overlay/.has-mount-program",
 	} {
 		if !slices.Contains(got, want) {
 			t.Errorf("storeMetadataPaths() is missing %q; got %v", want, got)
@@ -133,6 +143,11 @@ func TestReclaimStoreSweep(t *testing.T) {
 
 	// Metadata the library creates as root and that must come back to the owner.
 	imagesJSON := write(filepath.Join(mkdir(imagesSubdir), "images.json"))
+	// Initializing an empty graphroot creates the container store and its lock
+	// file too, even though this tool never creates a container.
+	containersDir := mkdir(containersSubdir)
+	containersLock := write(filepath.Join(containersDir, "containers.lock"))
+	storageLock := write(filepath.Join(graphRoot, "storage.lock"))
 	layersJSON := write(filepath.Join(mkdir(layersSubdir), "layers.json"))
 	manifest := write(filepath.Join(mkdir(imagesSubdir, "someimage"), "manifest"))
 	tarSplit := write(filepath.Join(graphRoot, layersSubdir, layerID+".tar-split.gz"))
@@ -169,7 +184,8 @@ func TestReclaimStoreSweep(t *testing.T) {
 		}
 		return int(st.Uid)
 	}
-	for _, p := range []string{imagesJSON, layersJSON, manifest, tarSplit, layerDir, lowerFile, linkFarm, linkEntry} {
+	for _, p := range []string{imagesJSON, layersJSON, manifest, tarSplit, layerDir, lowerFile, linkFarm, linkEntry,
+		containersDir, containersLock, storageLock} {
 		if got := ownerOf(p); got != ownerUID {
 			t.Errorf("%s is owned by %d, want the store owner %d", p, got, ownerUID)
 		}

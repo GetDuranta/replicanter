@@ -30,22 +30,34 @@ import (
 // damaged by an earlier run.
 
 // storeMetadataPaths lists the store-wide files and directories the library
-// rewrites as it saves. layers.json and images.json in particular are replaced
-// (atomic write + rename) on every mutation, so they revert to root:root after
-// each one and must be reclaimed after each one.
+// creates and rewrites as it opens and saves a store. layers.json and
+// images.json in particular are replaced (atomic write + rename) on every
+// mutation, so they revert to root:root after each one and must be reclaimed
+// after each one. The lock files and the top-level directories are created
+// once, when the library initializes a store in an empty graphroot; they too
+// land as root:root and lock the owner out of the store entirely.
 func (s *Store) storeMetadataPaths() []string {
 	return []string{
 		s.graphRoot,
+		filepath.Join(s.graphRoot, "storage.lock"),
+		filepath.Join(s.graphRoot, "userns.lock"),
 		s.driverDir(),
+		filepath.Join(s.driverDir(), ".has-mount-program"), // driver's init-time marker
 		s.linkDir(),
 		filepath.Join(s.driverDir(), "staging"),  // in-flight staged layers
 		filepath.Join(s.driverDir(), "tempdirs"), // layers pending deletion
 		s.layersDir(),
+		filepath.Join(s.layersDir(), "layers.lock"),
 		filepath.Join(s.layersDir(), "layers.json"),
 		filepath.Join(s.layersDir(), "volatile-layers.json"),
 		s.imagesDir(),
+		filepath.Join(s.imagesDir(), "images.lock"),
 		filepath.Join(s.imagesDir(), "images.json"),
 		filepath.Join(s.imagesDir(), "volatile-images.json"),
+		s.containersDir(),
+		filepath.Join(s.containersDir(), "containers.lock"),
+		filepath.Join(s.containersDir(), "containers.json"),
+		filepath.Join(s.containersDir(), "volatile-containers.json"),
 	}
 }
 
@@ -158,9 +170,14 @@ func reclaimStore(s *Store, log *slog.Logger) error {
 //     mean walking a running container's entire filesystem.
 //   - overlay/staging, overlay/tempdirs — layer content in flight or pending
 //     deletion, same reasoning as diff.
-//   - everything outside overlay/, overlay-images/ and overlay-layers/ — that
-//     is libpod's own state (volumes, networks, secrets, db.sql), which this
-//     tool never writes to.
+//   - everything outside overlay/, overlay-images/, overlay-layers/ and
+//     overlay-containers/ — that is libpod's own state (volumes, networks,
+//     secrets, db.sql), which this tool never writes to.
+//
+// overlay-containers/ is walked even though this tool never creates a
+// container: the library initializes that directory and its containers.lock
+// as part of opening any store, so in a graphroot that was empty when we first
+// opened it, both were created by us, as root.
 func walkMetadata(graphRoot, dir string) bool {
 	rel, err := filepath.Rel(graphRoot, dir)
 	if err != nil {
@@ -171,7 +188,7 @@ func walkMetadata(graphRoot, dir string) bool {
 	}
 	parts := strings.Split(rel, string(filepath.Separator))
 	switch parts[0] {
-	case imagesSubdir, layersSubdir:
+	case imagesSubdir, layersSubdir, containersSubdir:
 		return true // pure metadata, all of it
 	case driverSubdir:
 		switch len(parts) {

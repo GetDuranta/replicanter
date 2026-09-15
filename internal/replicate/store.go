@@ -17,10 +17,11 @@ import (
 // On-disk layout of an overlay store under its graphroot. The driver name is
 // part of the directory names, and this tool only ever opens overlay stores.
 const (
-	driverSubdir = "overlay"        // layer content + driver bookkeeping
-	layersSubdir = "overlay-layers" // layer metadata, big-data and tar-splits
-	imagesSubdir = "overlay-images" // image metadata and big-data
-	linkSubdir   = "l"              // driver's short-name symlink farm
+	driverSubdir     = "overlay"            // layer content + driver bookkeeping
+	layersSubdir     = "overlay-layers"     // layer metadata, big-data and tar-splits
+	imagesSubdir     = "overlay-images"     // image metadata and big-data
+	containersSubdir = "overlay-containers" // container metadata and big-data
+	linkSubdir       = "l"                  // driver's short-name symlink farm
 )
 
 // Store wraps an opened containers/storage store for a single graphroot and
@@ -63,7 +64,17 @@ func Open(graphRoot, runRoot string) (*Store, error) {
 	if err != nil {
 		return nil, fmt.Errorf("opening store at %q: %w", graphRoot, err)
 	}
-	return &Store{Store: s, graphRoot: graphRoot, owner: owner}, nil
+	st := &Store{Store: s, graphRoot: graphRoot, owner: owner}
+
+	// Opening a store initializes it if the graphroot was empty: the library
+	// creates the top-level directories and lock files, as root. Hand them back
+	// right away rather than waiting for this store's turn as a destination,
+	// which may never come if an earlier store's sync fails.
+	if err := reclaimStoreMetadata(st); err != nil {
+		st.Close()
+		return nil, fmt.Errorf("reclaiming ownership of store metadata at %q: %w", graphRoot, err)
+	}
+	return st, nil
 }
 
 // Close releases this store handle. It does NOT unmount layers or tear down
@@ -93,6 +104,11 @@ func (s *Store) layersDir() string { return filepath.Join(s.graphRoot, layersSub
 
 // imagesDir is <graphroot>/overlay-images: image metadata and big-data.
 func (s *Store) imagesDir() string { return filepath.Join(s.graphRoot, imagesSubdir) }
+
+// containersDir is <graphroot>/overlay-containers: container metadata and
+// big-data. This tool never creates a container, but the library initializes
+// the directory and its lock file whenever it opens a store.
+func (s *Store) containersDir() string { return filepath.Join(s.graphRoot, containersSubdir) }
 
 // linkDir is <graphroot>/overlay/l, the driver's symlink farm that keeps mount
 // option strings short.
