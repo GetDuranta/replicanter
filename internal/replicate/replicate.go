@@ -8,8 +8,9 @@ import (
 	"log/slog"
 	"os"
 
-	"github.com/opencontainers/go-digest"
+	"github.com/getduranta/replicanter/internal/ownership"
 	"github.com/getduranta/replicanter/internal/reflink"
+	"github.com/opencontainers/go-digest"
 	"go.podman.io/storage"
 	graphdriver "go.podman.io/storage/drivers"
 	"go.podman.io/storage/pkg/idtools"
@@ -55,21 +56,20 @@ func Sync(stores []*Store, opts Options) (Stats, error) {
 	log := opts.logger()
 
 	for _, dst := range stores {
-		for _, src := range stores {
-			if src == dst {
-				continue
+		err := syncInto(dst, stores, opts, &stats)
+
+		// Reclaim ownership even when the run failed: a store left holding
+		// root-owned metadata is unreadable by its own user (see ownership.go).
+		if rerr := reclaimAfterSync(dst, opts); rerr != nil {
+			rerr = fmt.Errorf("reclaiming ownership in %s: %w", dst.GraphRoot(), rerr)
+			if err == nil {
+				err = rerr
+			} else {
+				log.Error("reclaiming ownership after a failed sync", "err", rerr)
 			}
-			images, err := src.Images()
-			if err != nil {
-				return stats, fmt.Errorf("listing images in %s: %w", src.GraphRoot(), err)
-			}
-			for i := range images {
-				img := &images[i]
-				if err := replicateImage(src, dst, img, opts, &stats); err != nil {
-					return stats, fmt.Errorf("replicating image %s (%v) %s -> %s: %w",
-						img.ID, img.Names, src.GraphRoot(), dst.GraphRoot(), err)
-				}
-			}
+		}
+		if err != nil {
+			return stats, err
 		}
 	}
 
@@ -77,6 +77,39 @@ func Sync(stores []*Store, opts Options) (Stats, error) {
 		"layers_copied", stats.LayersCopied, "layers_skipped", stats.LayersSkipped,
 		"images_copied", stats.ImagesCopied, "images_skipped", stats.ImagesSkipped)
 	return stats, nil
+}
+
+// syncInto replicates into dst every image held by any other store.
+func syncInto(dst *Store, stores []*Store, opts Options, stats *Stats) error {
+	for _, src := range stores {
+		if src == dst {
+			continue
+		}
+		images, err := src.Images()
+		if err != nil {
+			return fmt.Errorf("listing images in %s: %w", src.GraphRoot(), err)
+		}
+		for i := range images {
+			img := &images[i]
+			if err := replicateImage(src, dst, img, opts, stats); err != nil {
+				return fmt.Errorf("replicating image %s (%v) %s -> %s: %w",
+					img.ID, img.Names, src.GraphRoot(), dst.GraphRoot(), err)
+			}
+		}
+	}
+	return nil
+}
+
+// reclaimAfterSync closes out a store's turn as a destination with the full
+// ownership sweep. It runs unconditionally, even for a store nothing was
+// replicated into: the sweep costs a fraction of a second (it never walks layer
+// content), and running it every time is what makes a store damaged by an
+// earlier run — or by an interrupted one — repair itself.
+func reclaimAfterSync(dst *Store, opts Options) error {
+	if opts.DryRun {
+		return nil // --dry-run mutates nothing, ownership included
+	}
+	return reclaimStore(dst, opts.logger())
 }
 
 func replicateImage(src, dst *Store, img *storage.Image, opts Options, stats *Stats) error {
@@ -108,8 +141,11 @@ func replicateImage(src, dst *Store, img *storage.Image, opts Options, stats *St
 		return nil
 	}
 
-	if err := createImage(src, dst, img); err != nil {
+	if err := createImage(src, dst, img, log); err != nil {
 		return err
+	}
+	if err := reclaimImage(dst, img.ID); err != nil {
+		return fmt.Errorf("reclaiming ownership of image %s: %w", img.ID, err)
 	}
 	stats.ImagesCopied++
 	log.Info("replicated image", "id", img.ID, "names", img.Names, "dst", dst.GraphRoot())
@@ -165,6 +201,7 @@ func replicateLayer(src, dst *Store, srcLayer *storage.Layer, opts Options, stat
 
 	differ := &reflinkDiffer{
 		srcDiffDir:         srcDiff,
+		ownerShift:         dst.shiftFrom(src),
 		srcTarSplitGzPath:  srcTarSplit,
 		uncompressedDigest: srcLayer.UncompressedDigest,
 		uncompressedSize:   srcLayer.UncompressedSize,
@@ -229,6 +266,12 @@ func replicateLayer(src, dst *Store, srcLayer *storage.Layer, opts Options, stat
 		return fmt.Errorf("committing layer %s: %w", srcLayer.ID, err)
 	}
 	committed = true
+
+	// Hand the layer's metadata back to the destination's owner before anything
+	// else: until this runs, dst's own user cannot read its layers.json.
+	if err := reclaimLayer(dst, srcLayer.ID); err != nil {
+		return fmt.Errorf("reclaiming ownership of layer %s: %w", srcLayer.ID, err)
+	}
 	stats.LayersCopied++
 
 	if opts.Verify {
@@ -240,7 +283,8 @@ func replicateLayer(src, dst *Store, srcLayer *storage.Layer, opts Options, stat
 	}
 
 	log.Info("replicated layer", "id", srcLayer.ID, "parent", srcLayer.Parent,
-		"uncompressed_size", srcLayer.UncompressedSize, "dst", dst.GraphRoot())
+		"uncompressed_size", srcLayer.UncompressedSize, "dst", dst.GraphRoot(),
+		"owner_shift", dst.shiftFrom(src))
 	return nil
 }
 
@@ -272,7 +316,7 @@ func verifyLayer(dst *Store, srcLayer *storage.Layer) error {
 // createImage creates the image record in dst referencing the (already
 // replicated) top layer, and copies every image big-data item (manifest,
 // config, signatures, …) so the image is complete and self-consistent.
-func createImage(src, dst *Store, img *storage.Image) error {
+func createImage(src, dst *Store, img *storage.Image, log *slog.Logger) error {
 	imgOpts := &storage.ImageOptions{
 		CreationDate: img.Created,
 		Digest:       img.Digest,
@@ -281,7 +325,12 @@ func createImage(src, dst *Store, img *storage.Image) error {
 		NamesHistory: img.NamesHistory,
 	}
 
-	created, err := dst.CreateImage(img.ID, img.Names, img.TopLayer, img.Metadata, imgOpts)
+	names, err := availableNames(dst, img, log)
+	if err != nil {
+		return err
+	}
+
+	created, err := dst.CreateImage(img.ID, names, img.TopLayer, img.Metadata, imgOpts)
 	if err != nil {
 		return fmt.Errorf("creating image record: %w", err)
 	}
@@ -307,15 +356,58 @@ func createImage(src, dst *Store, img *storage.Image) error {
 	return nil
 }
 
+// imageResolver looks up an image by ID or name. *Store satisfies it via the
+// embedded storage.Store; availableNames depends on this narrow interface so it
+// can be unit-tested without standing up a real overlay store.
+type imageResolver interface {
+	Image(id string) (*storage.Image, error)
+	GraphRoot() string
+}
+
+// availableNames returns the subset of the source image's names that are not
+// already claimed by a different image in dst.
+//
+// Container images are content-addressed: the image is fully identified by its
+// ID (derived from its config) and its layers by DiffID, so a replicated image
+// is complete and its layers are shared/reflinked by content hash whether or
+// not it carries a tag. A tag, by contrast, is a mutable human-facing pointer
+// owned by the build system. When a name like "localhost/app_db:latest" is
+// already claimed by a different image in dst — typically because that tag was
+// rebuilt to new content and this store still holds the previous one — we
+// decline to steal the tag and replicate the image untagged rather than fail
+// the whole sync. Moving tags is not replicanter's call; getting the content
+// onto every store is. The skipped name is logged.
+func availableNames(dst imageResolver, img *storage.Image, log *slog.Logger) ([]string, error) {
+	var names []string
+	for _, name := range img.Names {
+		existing, err := dst.Image(name)
+		if errors.Is(err, storage.ErrImageUnknown) {
+			names = append(names, name)
+			continue
+		}
+		if err != nil {
+			return nil, fmt.Errorf("checking dst for name %q: %w", name, err)
+		}
+		if existing.ID == img.ID {
+			names = append(names, name)
+			continue
+		}
+		log.Warn("skipping name already claimed by another image in dst; replicating untagged",
+			"name", name, "image", img.ID, "held_by", existing.ID, "dst", dst.GraphRoot())
+	}
+	return names, nil
+}
+
 // manifestDigest computes the digest the storage library records for a manifest
 // big-data item. A manifest's digest is the sha256 of its exact bytes.
 func manifestDigest(data []byte) (digest.Digest, error) {
 	return digest.FromBytes(data), nil
 }
 
-// cloneTreeInto reflinks the directory tree src into dest. It is the bridge
-// from the differ to the reflink package; kept here so the differ stays free
-// of filesystem-walk concerns.
-func cloneTreeInto(src, dest string) error {
-	return reflink.CloneTree(src, dest)
+// cloneTreeInto reflinks the directory tree src into dest, translating the
+// source store owner's identity into the destination's as it goes. It is the
+// bridge from the differ to the reflink package; kept here so the differ stays
+// free of filesystem-walk concerns.
+func cloneTreeInto(src, dest string, shift ownership.Shift) error {
+	return reflink.CloneTree(src, dest, shift)
 }

@@ -10,8 +10,8 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/getduranta/replicanter/internal/ownership"
 	"github.com/getduranta/replicanter/internal/reflink"
-	"golang.org/x/sys/unix"
 )
 
 // StorageVersion is the go.podman.io/storage version this binary is built
@@ -90,15 +90,17 @@ type idRange struct {
 
 func (r idRange) String() string { return fmt.Sprintf("%d:%d", r.start, r.count) }
 
-// ownerUsername returns the username that owns the given path.
+// ownerUsername returns the username that owns the given path. This is the same
+// inference the replicator uses to decide who a store's files must belong to
+// (see internal/ownership).
 func ownerUsername(path string) (string, error) {
-	var st unix.Stat_t
-	if err := unix.Stat(path, &st); err != nil {
-		return "", fmt.Errorf("stat %q: %w", path, err)
-	}
-	u, err := user.LookupId(fmt.Sprintf("%d", st.Uid))
+	owner, err := ownership.Of(path)
 	if err != nil {
-		return "", fmt.Errorf("looking up owner uid %d of %q: %w", st.Uid, path, err)
+		return "", err
+	}
+	u, err := user.LookupId(fmt.Sprintf("%d", owner.UID))
+	if err != nil {
+		return "", fmt.Errorf("looking up owner uid %d of %q: %w", owner.UID, path, err)
 	}
 	return u.Username, nil
 }

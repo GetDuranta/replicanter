@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 
+	"github.com/getduranta/replicanter/internal/ownership"
 	"github.com/opencontainers/go-digest"
 	graphdriver "go.podman.io/storage/drivers"
 	"go.podman.io/storage/pkg/archive"
@@ -16,13 +17,16 @@ import (
 // directory the driver provides, instead of unpacking a tar stream. This is
 // the short-circuit: layer bytes move via copy-on-write, not serialization.
 //
-// The digests/sizes/ownership are transcribed verbatim from the source layer
-// record so that, once the staged layer is committed, the destination layer's
-// metadata is byte-truthful about its content (PLAN.md invariant #2). The
-// library copies these straight from the returned DriverWithDifferOutput onto
-// the new layer record (layers.go: applyDiffFromStagingDirectory).
+// The digests/sizes are transcribed verbatim from the source layer record so
+// that, once the staged layer is committed, the destination layer's metadata is
+// byte-truthful about its content (PLAN.md invariant #2). The library copies
+// these straight from the returned DriverWithDifferOutput onto the new layer
+// record (layers.go: applyDiffFromStagingDirectory). The recorded UID/GID sets
+// are in-layer (tar header) ids, so they too carry over unchanged — the
+// ownership translation below applies to on-disk ids, not to these.
 type reflinkDiffer struct {
 	srcDiffDir         string
+	ownerShift         ownership.Shift
 	srcTarSplitGzPath  string // "" if the source layer has no tar-split
 	uncompressedDigest digest.Digest
 	uncompressedSize   int64
@@ -37,11 +41,13 @@ type reflinkDiffer struct {
 // source layer's content into it and report the precomputed metadata.
 //
 // The TarOptions (id-mapping for tar extraction) and DifferOptions are
-// deliberately ignored: we copy the exact on-disk bytes and ownership of the
-// source layer, which is correct precisely because all builders share an
-// identical subuid/subgid range (a documented precondition).
+// deliberately ignored: we copy the exact on-disk bytes of the source layer,
+// and its ownership, which is correct precisely because all builders share an
+// identical subuid/subgid range (a documented precondition). The one identity
+// that is not shared is the store owner's own uid/gid — what container id 0
+// maps to in a rootless store — so ownerShift rewrites it as we clone.
 func (d *reflinkDiffer) ApplyDiff(dest string, _ *archive.TarOptions, _ *graphdriver.DifferOptions) (graphdriver.DriverWithDifferOutput, error) {
-	if err := cloneTreeInto(d.srcDiffDir, dest); err != nil {
+	if err := cloneTreeInto(d.srcDiffDir, dest, d.ownerShift); err != nil {
 		return graphdriver.DriverWithDifferOutput{}, fmt.Errorf("reflinking %q into staging dir: %w", d.srcDiffDir, err)
 	}
 

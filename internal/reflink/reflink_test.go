@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/getduranta/replicanter/internal/ownership"
 	"golang.org/x/sys/unix"
 )
 
@@ -73,7 +74,7 @@ func TestCloneTreePreservesTree(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := CloneTree(src, dst); err != nil {
+	if err := CloneTree(src, dst, ownership.Shift{}); err != nil {
 		t.Fatalf("CloneTree: %v", err)
 	}
 
@@ -91,5 +92,35 @@ func TestCloneTreePreservesTree(t *testing.T) {
 	}
 	if fi.Mode().Perm() != 0o640 {
 		t.Fatalf("cloned file mode = %v, want 0640", fi.Mode().Perm())
+	}
+}
+
+// TestCloneTreeShiftsOnlyTheStoreOwner checks the id translation without needing
+// root: the shift maps the current user's own id (standing in for the source
+// store owner) to itself, so every file must come out unchanged, while ids that
+// are not the source owner's are never candidates for translation at all.
+func TestCloneTreeShiftsOnlyTheStoreOwner(t *testing.T) {
+	base := tmpOnBtrfs(t)
+	src := filepath.Join(base, "src")
+	dst := filepath.Join(base, "dst")
+
+	if err := os.MkdirAll(src, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(src, "file"), []byte("hello"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	me := ownership.Owner{UID: uint32(os.Getuid()), GID: uint32(os.Getgid())}
+	if err := CloneTree(src, dst, ownership.Shift{From: me, To: me}); err != nil {
+		t.Fatalf("CloneTree: %v", err)
+	}
+
+	var st unix.Stat_t
+	if err := unix.Lstat(filepath.Join(dst, "file"), &st); err != nil {
+		t.Fatal(err)
+	}
+	if st.Uid != me.UID || st.Gid != me.GID {
+		t.Fatalf("cloned file owned by %d:%d, want %s", st.Uid, st.Gid, me)
 	}
 }

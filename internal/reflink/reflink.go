@@ -14,6 +14,7 @@ import (
 	"os"
 	"path/filepath"
 
+	"github.com/getduranta/replicanter/internal/ownership"
 	"golang.org/x/sys/unix"
 )
 
@@ -84,13 +85,20 @@ func Probe(srcDir, dstDir string) error {
 // CloneTree recursively clones the directory tree rooted at src into dst,
 // reflinking the content of every regular file. Directories, symlinks, devices
 // (including overlay whiteout char devices), FIFOs and sockets are recreated;
-// ownership (uid/gid), permission bits, and extended attributes are preserved
-// exactly so the cloned layer is byte- and metadata-faithful to the source.
+// permission bits, extended attributes and timestamps are preserved exactly so
+// the cloned layer is byte- and metadata-faithful to the source.
+//
+// Ownership is preserved too, except that shift rewrites the source store
+// owner's own uid/gid to the destination store owner's. In a rootless store
+// those ids are what container uid/gid 0 maps to, so they name a different
+// identity in each store and must be translated; every other id (notably the
+// shared subuid/subgid range) means the same thing on both sides and is copied
+// verbatim. Pass the zero Shift to copy ownership unchanged.
 //
 // dst is created if it does not exist. The caller is expected to run with
 // enough privilege (root) to chown files to the subuid-owned identities found
 // in container layers.
-func CloneTree(src, dst string) error {
+func CloneTree(src, dst string, shift ownership.Shift) error {
 	hardlinks := map[uint64]string{} // src inode -> already-created dst path
 
 	return filepath.WalkDir(src, func(path string, d fs.DirEntry, err error) error {
@@ -149,16 +157,18 @@ func CloneTree(src, dst string) error {
 			}
 		}
 
-		return applyMetadata(target, &st, path)
+		return applyMetadata(target, &st, path, shift)
 	})
 }
 
 // applyMetadata copies ownership, permission bits, extended attributes and
 // timestamps from a source entry (described by st, located at srcPath) onto
-// target, without following symlinks.
-func applyMetadata(target string, st *unix.Stat_t, srcPath string) error {
-	if err := unix.Lchown(target, int(st.Uid), int(st.Gid)); err != nil {
-		return fmt.Errorf("lchown %s to %d:%d: %w", target, st.Uid, st.Gid, err)
+// target, without following symlinks. Ownership passes through shift on the
+// way (see CloneTree).
+func applyMetadata(target string, st *unix.Stat_t, srcPath string, shift ownership.Shift) error {
+	uid, gid := shift.Map(st.Uid, st.Gid)
+	if err := unix.Lchown(target, int(uid), int(gid)); err != nil {
+		return fmt.Errorf("lchown %s to %d:%d: %w", target, uid, gid, err)
 	}
 
 	// chmod is meaningless (and errors) on symlinks; their perms are fixed.
